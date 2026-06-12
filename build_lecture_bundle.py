@@ -31,6 +31,7 @@ TRANSCRIPTS_JSON = WORK_DIR / "transcripts.json"
 ALIGNMENT_JSON = WORK_DIR / "alignment_candidates.json"
 REVIEW_JSON = WORK_DIR / "review_summaries.json"
 REVIEW_MD = WORK_DIR / "alignment_review.md"
+STUDENT_REPORT_MD = WORK_DIR / "student_quality_report.md"
 
 
 R_ID_RE = re.compile(r"(R\d{8}-\d{6})")
@@ -81,6 +82,25 @@ STOP_TERMS = {
     "第",
     "页",
 }
+
+ASR_NOISE_TERMS = {
+    "好多人",
+    "感觉我",
+    "一天天",
+    "同学会问",
+    "屏蔽掉",
+    "新疆",
+    "上厕所",
+    "吃饭",
+    "休息",
+    "管理员",
+    "刷视频",
+    "哈哈",
+    "我先去",
+    "不好过",
+}
+
+LECTURE_PREFIXES = ("审题定位", "材料拆解", "采点思路", "答案组织", "易错提醒")
 
 
 MANUAL_SELECTED_IDS: dict[str, list[str]] = {
@@ -789,13 +809,45 @@ def short_clause(text: str, limit: int = 58) -> str:
     cut_positions = [pos for token in "。；;，," if 14 <= (pos := text.find(token)) <= limit]
     if cut_positions:
         return text[: min(cut_positions)].strip(" ：:；;，,。.")
-    return text[:limit].rstrip(" ：:；;，,。.") + "..."
+    return text[:limit].rstrip(" ：:；;，,。.") + "等"
 
 
 def clean_question_title(title: str) -> str:
     title = re.sub(r"^第[一二三四五六七八九十百零两\d]+题[:：]?", "", title)
     title = re.sub(r"（\d+\s*分）", "", title)
     return short_clause(title, limit=74)
+
+
+def meaningful_prompt(text: str) -> bool:
+    compact = compact_text(text)
+    return len(compact) >= 8 and "材料" not in compact[:4]
+
+
+def question_prompt(question: Question) -> str:
+    title = clean_question_title(question.title)
+    prompt_lines: list[str] = []
+    for line in question.question_text.splitlines():
+        line = clean_inline(line)
+        if not line:
+            continue
+        if line.startswith("要求") or line.startswith("材料"):
+            break
+        prompt_lines.append(line)
+        if len("".join(prompt_lines)) >= 120:
+            break
+
+    prompt = title
+    if prompt_lines:
+        first = " ".join(prompt_lines)
+        if not meaningful_prompt(prompt):
+            prompt = first
+        elif first.startswith("．．．") or prompt.endswith("请用一段话") or prompt.endswith("请你以"):
+            prompt = prompt + first
+
+    prompt = prompt.replace("．．．", "")
+    prompt = re.sub(r"（\d+\s*分）", "", prompt)
+    prompt = clean_inline(prompt)
+    return short_clause(prompt, limit=96) if meaningful_prompt(prompt) else "本题设问"
 
 
 def clean_reference_answer(answer_text: str) -> str:
@@ -869,6 +921,8 @@ def transcript_focus_sentence(transcript_text: str, question: Question) -> str:
         compact = compact_text(sentence)
         if not 18 <= len(compact) <= 120:
             continue
+        if "..." in sentence or any(term in sentence for term in ASR_NOISE_TERMS):
+            continue
         score = 0.0
         score += 0.9 * len([term for term in cue_terms if term in sentence])
         score += 0.5 * len([term for term in question_terms if term and term in sentence])
@@ -883,8 +937,9 @@ def transcript_focus_sentence(transcript_text: str, question: Question) -> str:
 
 
 def extractive_bullets(transcript_text: str, question: Question, *, max_bullets: int = 5) -> list[str]:
+    del transcript_text
     intro, points = split_answer_points(question.answer_text)
-    title = clean_question_title(question.title)
+    title = question_prompt(question)
     point_summary = summarize_points(points)
     bullets: list[str] = [
         f"审题定位：{chapter_method_hint(question.chapter_title)}本题要处理的是：{title}。",
@@ -906,11 +961,7 @@ def extractive_bullets(transcript_text: str, question: Question, *, max_bullets:
     else:
         bullets.append("答案组织：先回应设问，再用材料依据展开说明，必要时在结尾回到题干要求。")
 
-    focus = transcript_focus_sentence(transcript_text, question)
-    if focus:
-        bullets.append(f"易错提醒：转写中特别提示“{focus}”，复习时应把这句话对应到题干和答案层次中。")
-    else:
-        bullets.append(f"易错提醒：不要脱离“{title}”泛泛作答，也不要把材料现象原样堆叠成答案。")
+    bullets.append(f"易错提醒：不要脱离“{title}”泛泛作答，也不要把材料现象原样堆叠成答案。")
 
     return bullets[:max_bullets]
 
@@ -1065,9 +1116,13 @@ def apply_manual_review(args: argparse.Namespace) -> int:
             entry["status"] = "unconfirmed"
             entry["review_required"] = True
             entry["unconfirmed_reason"] = MANUAL_UNCONFIRMED[r_id]
+            entry["student_ready_status"] = "skipped"
+            entry["student_not_ready_reason"] = MANUAL_UNCONFIRMED[r_id]
             for note in entry.get("question_notes", []):
                 note["status"] = "unconfirmed"
                 note["review_notes"] = MANUAL_UNCONFIRMED[r_id]
+                note["student_ready_status"] = "skipped"
+                note["student_not_ready_reason"] = MANUAL_UNCONFIRMED[r_id]
             unconfirmed_count += 1
             continue
 
@@ -1083,14 +1138,25 @@ def apply_manual_review(args: argparse.Namespace) -> int:
             if not bullets:
                 continue
             review_note = "人工复核：转写主题、题干关键词或文件名线索与本题一致。"
+            student_ready_status = "skipped"
+            student_ready_reason = ""
             if manual_bullets:
                 review_note = "人工复核：跨题转写已按题干和主题词切分。"
+                student_ready_status = "ready"
+                student_ready_reason = "手工复核讲义要点，已按题干和主题词切分。"
+            elif entry.get("confidence") == "high":
+                student_ready_status = "ready"
+                student_ready_reason = "高置信度来源，正文采用安全讲义模板生成。"
+            else:
+                student_ready_reason = "严格可靠策略：非高置信度且无手工讲义要点，移入附录供追溯。"
             question_notes.append(
                 {
                     "question_id": qid,
                     "status": "confirmed",
                     "summary_bullets": bullets,
                     "review_notes": review_note,
+                    "student_ready_status": student_ready_status,
+                    "student_ready_reason": student_ready_reason,
                 }
             )
 
@@ -1100,15 +1166,23 @@ def apply_manual_review(args: argparse.Namespace) -> int:
             entry["selected_question_ids"] = selected_ids
             entry["question_notes"] = question_notes
             entry["unconfirmed_reason"] = ""
+            if any(note["student_ready_status"] == "ready" for note in question_notes):
+                entry["student_ready_status"] = "ready"
+                entry["student_not_ready_reason"] = ""
+            else:
+                entry["student_ready_status"] = "skipped"
+                entry["student_not_ready_reason"] = "严格可靠策略：没有可进入正文的可靠讲解。"
             confirmed_count += 1
         else:
             entry["status"] = "unconfirmed"
             entry["review_required"] = True
             entry["question_notes"] = []
             entry["unconfirmed_reason"] = "人工复核后未生成可用讲解要点。"
+            entry["student_ready_status"] = "skipped"
+            entry["student_not_ready_reason"] = entry["unconfirmed_reason"]
             unconfirmed_count += 1
 
-    notes_by_q, unconfirmed_entries = build_notes_by_question(review_data)
+    notes_by_q, unconfirmed_entries, _ = build_notes_by_question(review_data)
     review_data["manual_review"] = {
         "status": "applied",
         "confirmed_entries": confirmed_count,
@@ -1125,20 +1199,34 @@ def apply_manual_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_notes_by_question(review_data: dict[str, Any]) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+def build_notes_by_question(
+    review_data: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     notes_by_q: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    unconfirmed: list[dict[str, Any]] = []
+    appendix_entries: list[dict[str, Any]] = []
+    skipped_by_q: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in review_data["entries"]:
         entry_status = entry.get("status", "needs_review")
         if entry_status != "confirmed":
-            unconfirmed.append(entry)
+            appendix_entries.append(entry)
+            for qid in entry.get("selected_question_ids", []):
+                skipped_by_q[qid].append(entry)
             continue
         confirmed_any = False
+        skipped_any = False
         for note in entry.get("question_notes", []):
             if note.get("status", entry_status) != "confirmed":
+                skipped_any = True
+                skipped_by_q[note.get("question_id", "")].append(entry)
+                continue
+            if note.get("student_ready_status") != "ready":
+                skipped_any = True
+                skipped_by_q[note.get("question_id", "")].append(entry)
                 continue
             bullets = [bullet.strip() for bullet in note.get("summary_bullets", []) if bullet.strip()]
             if not bullets:
+                skipped_any = True
+                skipped_by_q[note.get("question_id", "")].append(entry)
                 continue
             confirmed_any = True
             notes_by_q[note["question_id"]].append(
@@ -1148,40 +1236,82 @@ def build_notes_by_question(review_data: dict[str, Any]) -> tuple[dict[str, list
                     "audio_path": entry.get("audio_path", ""),
                     "confidence": entry.get("confidence", ""),
                     "review_notes": note.get("review_notes", ""),
+                    "student_ready_reason": note.get("student_ready_reason", ""),
                     "bullets": bullets,
                 }
             )
         if not confirmed_any:
-            unconfirmed.append(entry)
-    return notes_by_q, unconfirmed
+            appendix_entries.append(entry)
+        elif skipped_any:
+            entry_copy = dict(entry)
+            entry_copy["student_not_ready_reason"] = "部分讲解片段未达到学生版正文采用标准。"
+            appendix_entries.append(entry_copy)
+    skipped_by_q.pop("", None)
+    return notes_by_q, appendix_entries, skipped_by_q
 
 
-def render_lecture_section(question: Question, notes: list[dict[str, Any]]) -> str:
+def merged_bullets(notes: list[dict[str, Any]]) -> list[str]:
+    by_prefix: dict[str, str] = {}
+    extras: list[str] = []
+    for note in notes:
+        for bullet in note["bullets"]:
+            bullet = bullet.strip()
+            if not bullet:
+                continue
+            prefix = bullet.split("：", 1)[0] if "：" in bullet else ""
+            if prefix in LECTURE_PREFIXES:
+                by_prefix.setdefault(prefix, bullet)
+            elif bullet not in extras:
+                extras.append(bullet)
+    merged = [by_prefix[prefix] for prefix in LECTURE_PREFIXES if prefix in by_prefix]
+    for bullet in extras:
+        if len(merged) >= 6:
+            break
+        merged.append(bullet)
+    return merged
+
+
+def render_source_summary(notes: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for note in notes:
+        transcript_name = Path(note["transcript_path"]).name
+        audio_name = Path(note["audio_path"]).name if note.get("audio_path") else "缺失录音"
+        confidence = note.get("confidence", "")
+        parts.append(f"`{transcript_name}`（录音：`{audio_name}`，置信度：{confidence}）")
+    return "；".join(parts)
+
+
+def render_lecture_section(
+    question: Question,
+    notes: list[dict[str, Any]],
+    skipped_sources: list[dict[str, Any]],
+) -> str:
     lines = ["### 🎧 讲解"]
     if not notes:
         lines.append("")
-        lines.append("*暂无确认讲解，相关未确认转写见文末附录。*")
+        if skipped_sources:
+            lines.append("*暂无可靠讲解来源；已有转写因匹配或可读性风险移入文末附录。*")
+        else:
+            lines.append("*暂无可靠讲解来源。*")
         return "\n".join(lines)
 
-    for idx, note in enumerate(notes, start=1):
-        if len(notes) > 1:
-            lines.append("")
-            lines.append(f"**讲解片段 {idx}**")
-        lines.append("")
-        source = f"来源：`{Path(note['transcript_path']).name}`"
-        if note.get("audio_path"):
-            source += f"；录音：`{Path(note['audio_path']).name}`"
-        source += f"；复核状态：已确认；整理方式：讲义式提炼；置信度：{note.get('confidence', 'manual')}"
-        lines.append(f"> {source}")
-        if note.get("review_notes"):
-            lines.append(f"> 复核备注：{note['review_notes']}")
-        lines.append("")
-        for bullet in note["bullets"]:
-            lines.append(f"- {bullet}")
+    lines.append("")
+    lines.append(
+        f"> 来源：{render_source_summary(notes)}；复核状态：学生版已采用；整理方式：讲义式提炼。"
+    )
+    reasons = sorted({note.get("student_ready_reason", "") for note in notes if note.get("student_ready_reason")})
+    if reasons:
+        lines.append(f"> 采用依据：{'；'.join(reasons)}")
+    lines.append("")
+    for bullet in merged_bullets(notes):
+        lines.append(f"- {bullet}")
     return "\n".join(lines)
 
 
-def insert_lecture_sections(notes_by_q: dict[str, list[dict[str, Any]]]) -> str:
+def insert_lecture_sections(
+    notes_by_q: dict[str, list[dict[str, Any]]],
+    skipped_by_q: dict[str, list[dict[str, Any]]],
+) -> str:
     questions = parse_questions()
     qid_by_start = {question.start_line: question.id for question in questions}
     question_by_id = {question.id: question for question in questions}
@@ -1209,29 +1339,43 @@ def insert_lecture_sections(notes_by_q: dict[str, list[dict[str, Any]]]) -> str:
             before.pop()
         output.extend(before)
         output.append("")
-        output.extend(render_lecture_section(question, notes_by_q.get(qid, [])).splitlines())
+        output.extend(
+            render_lecture_section(
+                question,
+                notes_by_q.get(qid, []),
+                skipped_by_q.get(qid, []),
+            ).splitlines()
+        )
         output.append("")
         output.extend(after)
         i = question.end_line
     return "\n".join(output).rstrip() + "\n"
 
 
-def render_appendix(unconfirmed: list[dict[str, Any]], review_data: dict[str, Any]) -> str:
+def render_appendix(appendix_entries: list[dict[str, Any]], review_data: dict[str, Any]) -> str:
     lines = [
         "",
         "---",
         "",
-        "# 附录：待确认讲解转写",
+        "# 附录：未采用讲解来源",
         "",
-        "以下转写未插入题目正文，原因是匹配证据不足、内容过短、跨题无法可靠切分，或人工复核后仍不宜归入单题。",
+        "以下转写未插入题目正文，原因是匹配证据不足、内容过短、跨题无法可靠切分，或按学生版严格可靠策略不宜作为正文讲解。",
         "",
     ]
-    if not unconfirmed:
+    if not appendix_entries:
         lines.append("无。")
     else:
-        for entry in unconfirmed:
+        seen_r_ids: set[str] = set()
+        for entry in appendix_entries:
+            if entry["r_id"] in seen_r_ids:
+                continue
+            seen_r_ids.add(entry["r_id"])
             selected = "、".join(entry.get("selected_question_ids", [])) or "无"
-            reason = entry.get("unconfirmed_reason") or entry.get("status", "未确认")
+            reason = (
+                entry.get("student_not_ready_reason")
+                or entry.get("unconfirmed_reason")
+                or entry.get("status", "未确认")
+            )
             lines.append(f"## {entry['r_id']}")
             lines.append("")
             lines.append(f"- 转写：`{entry['transcript_path']}`")
@@ -1250,17 +1394,71 @@ def render_appendix(unconfirmed: list[dict[str, Any]], review_data: dict[str, An
     return "\n".join(lines).rstrip() + "\n"
 
 
+def write_student_quality_report(
+    review_data: dict[str, Any],
+    notes_by_q: dict[str, list[dict[str, Any]]],
+    appendix_entries: list[dict[str, Any]],
+    skipped_by_q: dict[str, list[dict[str, Any]]],
+) -> None:
+    questions = load_questions_from_work()
+    ready_source_count = sum(len(notes) for notes in notes_by_q.values())
+    appendix_r_ids = list(dict.fromkeys(entry["r_id"] for entry in appendix_entries))
+    lines = [
+        "# 学生版讲解质量报告",
+        "",
+        "## 汇总",
+        "",
+        f"- 正文采用讲解来源：{ready_source_count}",
+        f"- 正文覆盖题目：{len(notes_by_q)} / {len(questions)}",
+        f"- 移入附录转写：{len(appendix_r_ids)}",
+        f"- 原始复核条目：{len(review_data.get('entries', []))}",
+        "",
+        "## 移入附录的转写",
+        "",
+    ]
+    if appendix_entries:
+        for entry in appendix_entries:
+            reason = (
+                entry.get("student_not_ready_reason")
+                or entry.get("unconfirmed_reason")
+                or entry.get("status", "未确认")
+            )
+            selected = "、".join(entry.get("selected_question_ids", [])) or "无"
+            lines.append(f"- `{entry['r_id']}` -> {selected}：{reason}")
+    else:
+        lines.append("- 无。")
+
+    lines.extend(["", "## 暂无可靠讲解的题目", ""])
+    missing = [question for question in questions if question.id not in notes_by_q]
+    if not missing:
+        lines.append("- 无。")
+    else:
+        current_chapter = ""
+        for question in missing:
+            if question.chapter_title != current_chapter:
+                current_chapter = question.chapter_title
+                lines.append(f"### {current_chapter}")
+                lines.append("")
+            skipped_count = len(skipped_by_q.get(question.id, []))
+            suffix = "；有转写移入附录" if skipped_count else "；未匹配到可靠转写"
+            lines.append(f"- `{question.id}` 第{question.question_index}题：{question_prompt(question)}{suffix}")
+
+    STUDENT_REPORT_MD.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def render(args: argparse.Namespace) -> int:
     del args
     ensure_work_files()
     review_data = read_json(REVIEW_JSON)
-    notes_by_q, unconfirmed = build_notes_by_question(review_data)
-    body = insert_lecture_sections(notes_by_q)
-    body += render_appendix(unconfirmed, review_data)
+    notes_by_q, appendix_entries, skipped_by_q = build_notes_by_question(review_data)
+    body = insert_lecture_sections(notes_by_q, skipped_by_q)
+    body += render_appendix(appendix_entries, review_data)
     OUTPUT_MD.write_text(body, encoding="utf-8")
+    write_student_quality_report(review_data, notes_by_q, appendix_entries, skipped_by_q)
     print(f"Wrote {rel(OUTPUT_MD)}")
-    print(f"Questions with confirmed lecture notes: {len(notes_by_q)}")
-    print(f"Unconfirmed transcript entries: {len(unconfirmed)}")
+    print(f"Wrote {rel(STUDENT_REPORT_MD)}")
+    print(f"Questions with reliable lecture notes: {len(notes_by_q)}")
+    print(f"Transcript entries in appendix: {len(dict.fromkeys(entry['r_id'] for entry in appendix_entries))}")
     return 0
 
 
@@ -1279,9 +1477,11 @@ def check(args: argparse.Namespace) -> int:
 
     questions = parse_questions()
     review_data = read_json(REVIEW_JSON)
-    notes_by_q, unconfirmed = build_notes_by_question(review_data)
+    notes_by_q, appendix_entries, _ = build_notes_by_question(review_data)
     output = read_text(OUTPUT_MD)
     errors: list[str] = []
+    lecture_blocks = re.findall(r"### 🎧 讲解\n(.*?)(?=\n---\n|\Z)", output, flags=re.S)
+    lecture_text = "\n".join(lecture_blocks)
 
     if len(questions) != 115:
         errors.append(f"source question count expected 115, got {len(questions)}")
@@ -1295,6 +1495,17 @@ def check(args: argparse.Namespace) -> int:
         errors.append("output contains TODO")
     if re.search(r"来源：``|录音：``", output):
         errors.append("output contains empty source code span")
+    if "暂无确认讲解" in lecture_text:
+        errors.append("lecture placeholder still uses old unconfirmed wording")
+    if "本题要处理的是：。" in lecture_text:
+        errors.append("lecture contains empty question prompt")
+    if "转写中特别提示" in lecture_text:
+        errors.append("lecture contains raw transcript prompt wording")
+    if "..." in lecture_text:
+        errors.append("lecture contains ASCII truncation ellipsis")
+    for term in ASR_NOISE_TERMS:
+        if term in lecture_text:
+            errors.append(f"lecture contains likely ASR noise term: {term}")
 
     seen_entries: set[str] = set()
     for entry in review_data["entries"]:
@@ -1314,10 +1525,13 @@ def check(args: argparse.Namespace) -> int:
             continue
         if qid not in {question.id for question in questions}:
             errors.append(f"review references unknown question id: {qid}")
+        for note in notes:
+            if note.get("confidence") != "high" and not note.get("student_ready_reason", "").startswith("手工复核"):
+                errors.append(f"non-high source used without manual review: {note['r_id']} -> {qid}")
 
-    for entry in unconfirmed:
+    for entry in appendix_entries:
         if entry["r_id"] not in output:
-            errors.append(f"unconfirmed transcript missing from appendix: {entry['r_id']}")
+            errors.append(f"appendix transcript missing from output: {entry['r_id']}")
 
     known_missing = {item["r_id"] for item in review_data.get("audio_without_transcript", [])}
     expected_missing = {"R20240625-014512", "R20240626-064536"}
@@ -1332,8 +1546,8 @@ def check(args: argparse.Namespace) -> int:
         return 1
 
     print("Check passed.")
-    print(f"Confirmed lecture questions: {len(notes_by_q)}")
-    print(f"Unconfirmed transcript entries in appendix: {len(unconfirmed)}")
+    print(f"Reliable lecture questions: {len(notes_by_q)}")
+    print(f"Transcript entries in appendix: {len(dict.fromkeys(entry['r_id'] for entry in appendix_entries))}")
     return 0
 
 
