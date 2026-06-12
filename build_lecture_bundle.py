@@ -1313,28 +1313,30 @@ def insert_lecture_sections(
     skipped_by_q: dict[str, list[dict[str, Any]]],
 ) -> str:
     questions = parse_questions()
-    qid_by_start = {question.start_line: question.id for question in questions}
-    question_by_id = {question.id: question for question in questions}
-    source_lines = read_text(SOURCE_MD).splitlines()
     output: list[str] = []
-    i = 0
-    while i < len(source_lines):
-        line_no = i + 1
-        if line_no not in qid_by_start:
-            output.append(source_lines[i])
-            i += 1
+    current_chapter_index: int | None = None
+    has_rendered_question = False
+
+    for question in questions:
+        notes = notes_by_q.get(question.id, [])
+        if not notes:
             continue
 
-        qid = qid_by_start[line_no]
-        question = question_by_id[qid]
-        block_lines = source_lines[question.start_line - 1 : question.end_line]
+        if has_rendered_question:
+            output.extend(["", "---", ""])
+
+        if question.chapter_index != current_chapter_index:
+            current_chapter_index = question.chapter_index
+            output.append(f"# {question.chapter_title}")
+            output.append("")
+
+        block_lines = question.block.splitlines()
         insert_at = len(block_lines)
         for idx, block_line in enumerate(block_lines):
             if block_line.strip() == "---":
                 insert_at = idx
                 break
         before = block_lines[:insert_at]
-        after = block_lines[insert_at:]
         while before and not before[-1].strip():
             before.pop()
         output.extend(before)
@@ -1342,13 +1344,11 @@ def insert_lecture_sections(
         output.extend(
             render_lecture_section(
                 question,
-                notes_by_q.get(qid, []),
-                skipped_by_q.get(qid, []),
+                notes,
+                skipped_by_q.get(question.id, []),
             ).splitlines()
         )
-        output.append("")
-        output.extend(after)
-        i = question.end_line
+        has_rendered_question = True
     return "\n".join(output).rstrip() + "\n"
 
 
@@ -1482,19 +1482,31 @@ def check(args: argparse.Namespace) -> int:
     errors: list[str] = []
     lecture_blocks = re.findall(r"### 🎧 讲解\n(.*?)(?=\n---\n|\Z)", output, flags=re.S)
     lecture_text = "\n".join(lecture_blocks)
+    expected_rendered_questions = len(notes_by_q)
 
     if len(questions) != 115:
         errors.append(f"source question count expected 115, got {len(questions)}")
-    if output.count("### 🎧 讲解") != 115:
-        errors.append(f"lecture section count expected 115, got {output.count('### 🎧 讲解')}")
-    if output.count("### 📘 题目与材料") != 115:
-        errors.append("question/material section count changed")
-    if output.count("### ✍️ 参考答案") != 115:
-        errors.append("answer section count changed")
+    if output.count("### 🎧 讲解") != expected_rendered_questions:
+        errors.append(
+            "lecture section count expected "
+            f"{expected_rendered_questions}, got {output.count('### 🎧 讲解')}"
+        )
+    if output.count("### 📘 题目与材料") != expected_rendered_questions:
+        errors.append(
+            "question/material section count expected "
+            f"{expected_rendered_questions}, got {output.count('### 📘 题目与材料')}"
+        )
+    if output.count("### ✍️ 参考答案") != expected_rendered_questions:
+        errors.append(
+            "answer section count expected "
+            f"{expected_rendered_questions}, got {output.count('### ✍️ 参考答案')}"
+        )
     if "TODO" in output:
         errors.append("output contains TODO")
     if re.search(r"来源：``|录音：``", output):
         errors.append("output contains empty source code span")
+    if "暂无可靠讲解来源" in output:
+        errors.append("output contains missing lecture placeholder")
     if "暂无确认讲解" in lecture_text:
         errors.append("lecture placeholder still uses old unconfirmed wording")
     if "本题要处理的是：。" in lecture_text:
