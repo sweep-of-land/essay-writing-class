@@ -1,2 +1,5 @@
 *.pdf
 *.md
+*.WAV
+
+onnx/

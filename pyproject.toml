@@ -1,0 +1,12 @@
+[project]
+name = "essay-wariting-class"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyaudio>=0.2.14",
+    "pymupdf>=1.27.2.3",
+    "sherpa-onnx>=1.13.2",
+    "sherpa-onnx-bin>=1.13.2",
+]
