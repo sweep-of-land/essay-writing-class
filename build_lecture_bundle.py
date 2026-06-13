@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build the question + answer + lecture-notes bundle.
 
-The script is intentionally dependency-free. It creates intermediate files under
-``lecture_work/`` so automatic matching, manual review, rendering, and checking
-are repeatable.
+The lecture-note stages create intermediate files under ``lecture_work/`` so
+automatic matching, manual review, rendering, and checking are repeatable. The
+``build-source`` command uses PyMuPDF to rebuild the question + answer Markdown
+from the source PDFs.
 """
 
 from __future__ import annotations
@@ -22,6 +23,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 SOURCE_MD = ROOT / "2026刷题班_题目与答案合并版.md"
 OUTPUT_MD = ROOT / "2026刷题班_题目+答案+讲解合并版.md"
+PROBLEM_PDF = ROOT / "2026刷题班_讲义.pdf"
+ANSWER_PDF = ROOT / "2026刷题班_答案.pdf"
+PROBLEM_MD = ROOT / "2026刷题班_讲义_output.md"
+ANSWER_MD = ROOT / "2026刷题班_答案_output.md"
 AUDIO_DIR = ROOT / "audio"
 TRANSCRIPTS_DIR = ROOT / "transcripts"
 WORK_DIR = ROOT / "lecture_work"
@@ -845,6 +850,388 @@ def write_json(path: Path, data: Any) -> None:
 
 def read_json(path: Path) -> Any:
     return json.loads(read_text(path))
+
+
+@dataclass(frozen=True)
+class PdfLine:
+    text: str
+    x0: float
+    y0: float
+
+
+@dataclass
+class SourceQuestion:
+    title: str
+    page: str
+    content: str
+
+
+@dataclass
+class SourceChapter:
+    title: str
+    questions: list[SourceQuestion]
+
+
+def source_char_width(text: str) -> float:
+    return sum(2 if ord(char) > 127 else 1 for char in text) / 2
+
+
+def is_source_chapter_start(text: str) -> bool:
+    return text.strip().startswith("专项训练")
+
+
+def is_source_question_start(text: str) -> bool:
+    return bool(re.match(r"^第[一二三四五六七八九十百]+题", text.strip()))
+
+
+def is_source_page_number(text: str) -> bool:
+    return bool(re.fullmatch(r"-\s*\d+\s*-", text.strip()))
+
+
+def source_line_is_list_item(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^("
+            r"[\(（\[【\d1234567890一二三四五六七八九十]+[、）\]】.]"
+            r"|"
+            r"材料[\d一二三四五六七八九十]+"
+            r")",
+            text,
+        )
+    )
+
+
+def extract_pdf_lines(page: Any) -> tuple[str | None, list[PdfLine]]:
+    data = page.get_text("dict")
+    lines: list[PdfLine] = []
+    page_number: str | None = None
+    for block in data.get("blocks", []):
+        if block.get("type", 0) != 0:
+            continue
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+            if not text:
+                continue
+            if is_source_page_number(text):
+                match = re.search(r"\d+", text)
+                if match:
+                    page_number = match.group(0)
+                continue
+            bbox = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            lines.append(PdfLine(text=text, x0=float(bbox[0]), y0=float(bbox[1])))
+    lines.sort(key=lambda item: (round(item.y0, 1), item.x0))
+    return page_number, lines
+
+
+def source_body_left(lines: list[PdfLine]) -> float:
+    candidates = [
+        line.x0
+        for line in lines
+        if 40 <= line.x0 <= 140
+        and not is_source_chapter_start(line.text)
+        and not is_source_question_start(line.text)
+        and not is_source_page_number(line.text)
+    ]
+    if candidates:
+        return min(candidates)
+    return min((line.x0 for line in lines), default=0.0)
+
+
+def merge_pdf_lines(lines: list[PdfLine]) -> str:
+    if not lines:
+        return ""
+
+    paragraphs: list[str] = []
+    current = ""
+    last_raw_width = 0.0
+    body_left = source_body_left(lines)
+    full_line_threshold = 35
+    indent_threshold = 10
+    centered_threshold = 70
+
+    for line in lines:
+        text = line.text.strip()
+        if not text:
+            continue
+
+        offset = line.x0 - body_left
+        is_list_item = source_line_is_list_item(text)
+        is_indented_start = indent_threshold <= offset < centered_threshold
+        is_centered = offset >= centered_threshold
+        is_marker = text in {"【参考答案】", "【范文】"} or bool(re.match(r"^要求[：:]", text))
+        force_new = is_list_item or is_indented_start or is_centered or is_marker
+
+        if not current:
+            current = text
+            last_raw_width = source_char_width(text)
+            continue
+
+        should_merge = last_raw_width >= full_line_threshold and not force_new
+        if should_merge:
+            current += text
+        else:
+            paragraphs.append(current)
+            current = text
+
+        last_raw_width = source_char_width(text)
+
+    if current:
+        paragraphs.append(current)
+
+    return "\n\n".join(paragraphs)
+
+
+def convert_pdf_to_source_chapters(pdf_path: Path) -> list[SourceChapter]:
+    try:
+        import pymupdf  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError("PyMuPDF is required to build the source bundle.") from exc
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"Missing PDF: {rel(pdf_path)}")
+
+    chapters: list[SourceChapter] = []
+    current_chapter: SourceChapter | None = None
+    current_title = ""
+    current_page = ""
+    current_content: list[PdfLine] = []
+    current_page_number = ""
+
+    def save_current_question() -> None:
+        nonlocal current_title, current_page, current_content
+        if current_chapter is not None and current_title:
+            current_chapter.questions.append(
+                SourceQuestion(
+                    title=current_title,
+                    page=current_page,
+                    content=merge_pdf_lines(current_content),
+                )
+            )
+        current_title = ""
+        current_page = ""
+        current_content = []
+
+    with pymupdf.open(pdf_path) as doc:
+        for page in doc:
+            page_number, page_lines = extract_pdf_lines(page)
+            if page_number:
+                current_page_number = page_number
+
+            i = 0
+            while i < len(page_lines):
+                line = page_lines[i]
+                text = line.text
+
+                if is_source_chapter_start(text):
+                    save_current_question()
+                    if current_chapter is not None:
+                        chapters.append(current_chapter)
+                    current_chapter = SourceChapter(title=text, questions=[])
+                    i += 1
+                    continue
+
+                if is_source_question_start(text):
+                    save_current_question()
+                    title_parts = [text]
+                    j = i + 1
+                    while j < len(page_lines):
+                        next_text = page_lines[j].text
+                        prev_width = source_char_width(page_lines[j - 1].text)
+                        if (
+                            prev_width >= 30
+                            and not next_text.startswith(("要求", "【"))
+                            and not is_source_chapter_start(next_text)
+                            and not is_source_question_start(next_text)
+                        ):
+                            title_parts.append(next_text)
+                            j += 1
+                        else:
+                            break
+                    current_title = "".join(part.strip() for part in title_parts)
+                    current_page = current_page_number
+                    current_content = []
+                    i = j
+                    continue
+
+                if current_title:
+                    current_content.append(line)
+
+                i += 1
+
+    save_current_question()
+    if current_chapter is not None:
+        chapters.append(current_chapter)
+
+    return chapters
+
+
+def render_source_markdown(chapters: list[SourceChapter]) -> str:
+    lines: list[str] = []
+    for chapter in chapters:
+        lines.append(f"# {chapter.title}")
+        lines.append("")
+        for question in chapter.questions:
+            lines.append(f"## {question.title}")
+            if question.page:
+                lines.append(f"*（第 {question.page} 页）*")
+            lines.append("")
+            if question.content:
+                lines.append(question.content.rstrip())
+                lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_source_markdown(path: Path) -> list[SourceChapter]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing Markdown: {rel(path)}")
+
+    chapters: list[SourceChapter] = []
+    current_chapter: SourceChapter | None = None
+    current_question: SourceQuestion | None = None
+    content_buffer: list[str] = []
+
+    def save_current_question() -> None:
+        nonlocal current_question, content_buffer
+        if current_question is not None and current_chapter is not None:
+            current_question.content = "".join(content_buffer).strip()
+            current_chapter.questions.append(current_question)
+        current_question = None
+        content_buffer = []
+
+    def save_current_chapter() -> None:
+        nonlocal current_chapter
+        if current_chapter is not None:
+            save_current_question()
+            chapters.append(current_chapter)
+        current_chapter = None
+
+    for line in read_text(path).splitlines(keepends=True):
+        stripped = line.strip()
+        if line.startswith("# "):
+            save_current_chapter()
+            current_chapter = SourceChapter(title=stripped.removeprefix("# ").strip(), questions=[])
+            continue
+        if line.startswith("## "):
+            save_current_question()
+            current_question = SourceQuestion(
+                title=stripped.removeprefix("## ").strip(),
+                page="",
+                content="",
+            )
+            continue
+        page_match = re.search(r"[（(【]第\s*(\d+)\s*页[）)】]", stripped)
+        if page_match and current_question is not None:
+            current_question.page = page_match.group(1)
+            continue
+        if current_question is not None:
+            content_buffer.append(line)
+
+    save_current_chapter()
+    return chapters
+
+
+def normalize_source_key(text: str) -> str:
+    text = "".join(text.split())
+    return re.sub(r"[、，。:：（）()\[\]【】.\-\"'“”]", "", text)
+
+
+def extract_answer_body(content: str) -> str:
+    if "【参考答案】" in content:
+        return "【参考答案】\n" + content.split("【参考答案】", 1)[1].strip()
+    return content
+
+
+def merge_source_chapters(
+    problem_chapters: list[SourceChapter],
+    answer_chapters: list[SourceChapter],
+) -> tuple[str, dict[str, int]]:
+    merged_lines: list[str] = []
+    stats = {
+        "total_questions": 0,
+        "matched_by_order": 0,
+        "matched_by_title": 0,
+        "unmatched": 0,
+        "chapter_order_matches": 0,
+    }
+
+    for chapter_index, problem_chapter in enumerate(problem_chapters):
+        merged_lines.append(f"# {problem_chapter.title}\n")
+        answer_chapter: SourceChapter | None = None
+        problem_chapter_key = normalize_source_key(problem_chapter.title)
+        for candidate in answer_chapters:
+            if normalize_source_key(candidate.title) == problem_chapter_key:
+                answer_chapter = candidate
+                break
+        if answer_chapter is None and chapter_index < len(answer_chapters):
+            answer_chapter = answer_chapters[chapter_index]
+            stats["chapter_order_matches"] += 1
+
+        for question_index, question in enumerate(problem_chapter.questions):
+            stats["total_questions"] += 1
+            answer_question: SourceQuestion | None = None
+            match_type = "未匹配"
+
+            if answer_chapter is not None and question_index < len(answer_chapter.questions):
+                answer_question = answer_chapter.questions[question_index]
+                match_type = "顺序"
+                stats["matched_by_order"] += 1
+                question_key = normalize_source_key(question.title)
+                answer_key = normalize_source_key(answer_question.title)
+                if question_key in answer_key or answer_key in question_key or question_key == answer_key:
+                    match_type = "顺序+标题"
+                    stats["matched_by_title"] += 1
+                    stats["matched_by_order"] -= 1
+            else:
+                stats["unmatched"] += 1
+                match_type = "缺失"
+
+            problem_page = question.page or "未标注"
+            answer_page = answer_question.page if answer_question and answer_question.page else "未标注"
+
+            merged_lines.append(f"## {question.title}")
+            merged_lines.append(
+                f"\n> 📝 **题目所在页**：第 {problem_page} 页  |  "
+                f"💡 **答案所在页**：第 {answer_page} 页  |  "
+                f"🔗 **匹配方式**：{match_type}\n"
+            )
+            merged_lines.append("### 📘 题目与材料")
+            merged_lines.append(question.content)
+            merged_lines.append("")
+            merged_lines.append("### ✍️ 参考答案")
+            if answer_question is not None:
+                merged_lines.append(extract_answer_body(answer_question.content))
+            else:
+                merged_lines.append("*（未找到对应答案，可能是文件结构不一致）*")
+            merged_lines.append("\n---\n")
+
+    return "\n".join(merged_lines).rstrip() + "\n", stats
+
+
+def build_source(args: argparse.Namespace) -> int:
+    if args.regenerate_problem or not PROBLEM_MD.exists():
+        problem_chapters = convert_pdf_to_source_chapters(PROBLEM_PDF)
+        PROBLEM_MD.write_text(render_source_markdown(problem_chapters), encoding="utf-8")
+        print(f"Wrote {rel(PROBLEM_MD)}")
+    else:
+        problem_chapters = parse_source_markdown(PROBLEM_MD)
+        print(f"Using existing {rel(PROBLEM_MD)}")
+
+    answer_chapters = convert_pdf_to_source_chapters(ANSWER_PDF)
+    ANSWER_MD.write_text(render_source_markdown(answer_chapters), encoding="utf-8")
+    print(f"Wrote {rel(ANSWER_MD)}")
+
+    output, stats = merge_source_chapters(problem_chapters, answer_chapters)
+    SOURCE_MD.write_text(output, encoding="utf-8")
+    print(f"Wrote {rel(SOURCE_MD)}")
+    print(
+        "Match stats: "
+        f"total={stats['total_questions']}, "
+        f"title+order={stats['matched_by_title']}, "
+        f"order={stats['matched_by_order']}, "
+        f"unmatched={stats['unmatched']}, "
+        f"chapter_order={stats['chapter_order_matches']}"
+    )
+    return 0
 
 
 def chinese_num_to_int(raw: str) -> int | None:
@@ -2088,6 +2475,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="overwrite review_summaries.json with a fresh scaffold",
     )
     prepare_parser.set_defaults(func=prepare)
+
+    source_parser = subparsers.add_parser("build-source", help="build question + answer Markdown from PDFs")
+    source_parser.add_argument(
+        "--regenerate-problem",
+        action="store_true",
+        help="regenerate the question Markdown from the lecture PDF instead of reusing the existing file",
+    )
+    source_parser.set_defaults(func=build_source)
 
     review_parser = subparsers.add_parser("apply-review", help="apply built-in manual review decisions")
     review_parser.set_defaults(func=apply_manual_review)
