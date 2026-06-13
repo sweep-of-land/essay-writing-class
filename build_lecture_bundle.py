@@ -23,6 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 SOURCE_MD = ROOT / "2026刷题班_题目与答案合并版.md"
 OUTPUT_MD = ROOT / "2026刷题班_题目+答案+讲解合并版.md"
+OUTPUT_DOCX = ROOT / "2026刷题班_题目+答案+讲解合并版.docx"
 PROBLEM_PDF = ROOT / "2026刷题班_讲义.pdf"
 ANSWER_PDF = ROOT / "2026刷题班_答案.pdf"
 PROBLEM_MD = ROOT / "2026刷题班_讲义_output.md"
@@ -2438,6 +2439,315 @@ def render(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_workspace_path(raw: str | None, default: Path) -> Path:
+    if raw is None:
+        return default
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
+def set_docx_element_font(element: Any, font_name: str) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    r_pr = element.get_or_add_rPr()
+    r_fonts = r_pr.rFonts
+    if r_fonts is None:
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.append(r_fonts)
+    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+        r_fonts.set(qn(f"w:{attribute}"), font_name)
+
+
+def set_docx_style_font(style: Any, font_name: str) -> None:
+    style.font.name = font_name
+    set_docx_element_font(style._element, font_name)
+
+
+def set_docx_run_font(run: Any, font_name: str) -> None:
+    run.font.name = font_name
+    set_docx_element_font(run._element, font_name)
+
+
+def get_or_add_docx_style(document: Any, name: str, style_type: Any) -> Any:
+    try:
+        return document.styles[name]
+    except KeyError:
+        return document.styles.add_style(name, style_type)
+
+
+def setup_docx_styles(document: Any) -> None:
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.shared import Pt, RGBColor
+
+    font_name = "Microsoft YaHei"
+    compact_blue = RGBColor(0x2E, 0x74, 0xB5)
+    compact_dark_blue = RGBColor(0x1F, 0x4D, 0x78)
+    muted_gray = RGBColor(0x55, 0x55, 0x55)
+
+    styles = document.styles
+    normal = styles["Normal"]
+    set_docx_style_font(normal, font_name)
+    normal.font.size = Pt(11)
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.25
+
+    title = get_or_add_docx_style(document, "Bundle Title", WD_STYLE_TYPE.PARAGRAPH)
+    set_docx_style_font(title, font_name)
+    title.font.size = Pt(20)
+    title.font.bold = True
+    title.font.color.rgb = compact_dark_blue
+    title.paragraph_format.space_before = Pt(0)
+    title.paragraph_format.space_after = Pt(8)
+    title.paragraph_format.line_spacing = 1.25
+
+    subtitle = get_or_add_docx_style(document, "Bundle Subtitle", WD_STYLE_TYPE.PARAGRAPH)
+    set_docx_style_font(subtitle, font_name)
+    subtitle.font.size = Pt(9)
+    subtitle.font.color.rgb = muted_gray
+    subtitle.paragraph_format.space_before = Pt(0)
+    subtitle.paragraph_format.space_after = Pt(12)
+    subtitle.paragraph_format.line_spacing = 1.15
+
+    heading_tokens = [
+        ("Heading 1", 16, compact_blue, 18, 10),
+        ("Heading 2", 13, compact_blue, 14, 7),
+        ("Heading 3", 12, compact_dark_blue, 10, 5),
+    ]
+    for style_name, size, color, before, after in heading_tokens:
+        style = styles[style_name]
+        set_docx_style_font(style, font_name)
+        style.font.size = Pt(size)
+        style.font.bold = True
+        style.font.color.rgb = color
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+        style.paragraph_format.line_spacing = 1.25
+        style.paragraph_format.keep_with_next = True
+
+    bullet = styles["List Bullet"]
+    set_docx_style_font(bullet, font_name)
+    bullet.font.size = Pt(11)
+    bullet.paragraph_format.left_indent = Pt(27)
+    bullet.paragraph_format.first_line_indent = Pt(-13.5)
+    bullet.paragraph_format.space_before = Pt(0)
+    bullet.paragraph_format.space_after = Pt(4)
+    bullet.paragraph_format.line_spacing = 1.25
+
+    source_meta = get_or_add_docx_style(document, "Source Meta", WD_STYLE_TYPE.PARAGRAPH)
+    set_docx_style_font(source_meta, font_name)
+    source_meta.font.size = Pt(9)
+    source_meta.font.color.rgb = muted_gray
+    source_meta.paragraph_format.left_indent = Pt(12)
+    source_meta.paragraph_format.right_indent = Pt(12)
+    source_meta.paragraph_format.space_before = Pt(0)
+    source_meta.paragraph_format.space_after = Pt(4)
+    source_meta.paragraph_format.line_spacing = 1.15
+
+    label = get_or_add_docx_style(document, "Material Label", WD_STYLE_TYPE.PARAGRAPH)
+    set_docx_style_font(label, font_name)
+    label.font.size = Pt(11)
+    label.font.bold = True
+    label.font.color.rgb = compact_dark_blue
+    label.paragraph_format.space_before = Pt(4)
+    label.paragraph_format.space_after = Pt(4)
+    label.paragraph_format.line_spacing = 1.25
+
+
+def add_docx_page_field(paragraph: Any) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = " PAGE "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    text = OxmlElement("w:t")
+    text.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.extend([begin, instr, separate, text, end])
+
+
+def setup_docx_page(document: Any) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    section = document.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.top_margin = Inches(1)
+    section.right_margin = Inches(1)
+    section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1)
+    section.header_distance = Inches(0.492)
+    section.footer_distance = Inches(0.492)
+
+    header = section.header.paragraphs[0]
+    header.text = ""
+    header_run = header.add_run("2026刷题班 题目+答案+讲解合并版")
+    set_docx_run_font(header_run, "Microsoft YaHei")
+    header_run.font.size = Pt(8)
+    header_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    footer.text = ""
+    prefix = footer.add_run("第 ")
+    set_docx_run_font(prefix, "Microsoft YaHei")
+    prefix.font.size = Pt(8)
+    add_docx_page_field(footer)
+    suffix = footer.add_run(" 页")
+    set_docx_run_font(suffix, "Microsoft YaHei")
+    suffix.font.size = Pt(8)
+
+
+def clean_docx_display_text(text: str) -> str:
+    replacements = {
+        "📘": "",
+        "✍": "",
+        "🎧": "",
+        "📝": "",
+        "💡": "",
+        "🔗": "",
+        "\ufe0f": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+INLINE_MARKDOWN_RE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`)")
+
+
+def add_docx_inline_runs(paragraph: Any, text: str) -> None:
+    from docx.shared import Pt, RGBColor
+
+    text = clean_docx_display_text(text)
+    for part in INLINE_MARKDOWN_RE.split(text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+            set_docx_run_font(run, "Microsoft YaHei")
+            continue
+        if part.startswith("`") and part.endswith("`"):
+            run = paragraph.add_run(part[1:-1])
+            set_docx_run_font(run, "Consolas")
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x44, 0x44, 0x44)
+            continue
+        run = paragraph.add_run(part)
+        set_docx_run_font(run, "Microsoft YaHei")
+
+
+def add_docx_paragraph(document: Any, text: str, style: str | None = None) -> Any:
+    paragraph = document.add_paragraph(style=style)
+    add_docx_inline_runs(paragraph, text)
+    return paragraph
+
+
+def markdown_line_is_label(text: str) -> bool:
+    return bool(re.fullmatch(r"(材料[\d一二三四五六七八九十]+|【[^】]{1,8}】)", text.strip()))
+
+
+def export_markdown_to_docx(input_path: Path, output_path: Path) -> None:
+    from docx import Document
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Missing Markdown: {rel(input_path)}")
+
+    markdown = read_text(input_path)
+    document = Document()
+    setup_docx_page(document)
+    setup_docx_styles(document)
+
+    document.core_properties.title = "2026刷题班 题目+答案+讲解合并版"
+    document.core_properties.subject = "题目、参考答案与讲解"
+    document.core_properties.author = "build_lecture_bundle.py"
+
+    add_docx_paragraph(document, "2026刷题班 题目+答案+讲解合并版", "Bundle Title")
+    lecture_count = markdown.count("### 🎧 讲解")
+    appendix_count = len(re.findall(r"^##\s+R\d{8}-\d{6}", markdown, flags=re.M))
+    add_docx_paragraph(
+        document,
+        f"来源：{rel(input_path)} | 可靠讲解题目：{lecture_count} | 附录转写：{appendix_count}",
+        "Bundle Subtitle",
+    )
+
+    current_chapter_is_appendix = False
+    question_started_in_chapter = False
+    saw_chapter = False
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "---":
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading_match:
+            level = len(heading_match.group(1))
+            title = clean_docx_display_text(heading_match.group(2))
+            if level == 1:
+                if saw_chapter:
+                    document.add_page_break()
+                current_chapter_is_appendix = "附录" in title
+                question_started_in_chapter = False
+                saw_chapter = True
+                document.add_heading(title, level=1)
+                continue
+            if level == 2:
+                if not current_chapter_is_appendix and question_started_in_chapter:
+                    document.add_page_break()
+                question_started_in_chapter = True
+                document.add_heading(title, level=2)
+                continue
+            document.add_heading(title, level=3)
+            continue
+
+        if stripped.startswith(">"):
+            add_docx_paragraph(document, stripped.lstrip("> ").strip(), "Source Meta")
+            continue
+
+        if stripped.startswith("- "):
+            add_docx_paragraph(document, stripped[2:].strip(), "List Bullet")
+            continue
+
+        if markdown_line_is_label(stripped):
+            add_docx_paragraph(document, stripped, "Material Label")
+            continue
+
+        paragraph = add_docx_paragraph(document, stripped)
+        if len(stripped) <= 18 and stripped.endswith(("：", ":")):
+            paragraph.runs[0].bold = True
+
+    # Prevent Word from appending a blank page when the last paragraph only contains a break.
+    if document.paragraphs and not document.paragraphs[-1].text.strip():
+        document.paragraphs[-1]._element.getparent().remove(document.paragraphs[-1]._element)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    document.save(output_path)
+
+
+def export_docx(args: argparse.Namespace) -> int:
+    input_path = resolve_workspace_path(args.input, OUTPUT_MD)
+    output_path = resolve_workspace_path(args.output, OUTPUT_DOCX)
+    export_markdown_to_docx(input_path, output_path)
+    print(f"Wrote {rel(output_path)}")
+    return 0
+
+
 def ensure_work_files() -> None:
     missing = [path for path in (QUESTIONS_JSON, TRANSCRIPTS_JSON, ALIGNMENT_JSON, REVIEW_JSON) if not path.exists()]
     if missing:
@@ -2567,6 +2877,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     render_parser = subparsers.add_parser("render", help="render final Markdown")
     render_parser.set_defaults(func=render)
+
+    docx_parser = subparsers.add_parser("export-docx", help="export final Markdown to Word DOCX")
+    docx_parser.add_argument(
+        "--input",
+        help=f"source Markdown path, defaults to {rel(OUTPUT_MD)}",
+    )
+    docx_parser.add_argument(
+        "--output",
+        help=f"output DOCX path, defaults to {rel(OUTPUT_DOCX)}",
+    )
+    docx_parser.set_defaults(func=export_docx)
 
     check_parser = subparsers.add_parser("check", help="validate final Markdown")
     check_parser.set_defaults(func=check)
