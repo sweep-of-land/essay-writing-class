@@ -47,6 +47,8 @@ SPEAKER_RE = re.compile(r"^\s*\d+号讲话人\s+\d{2}:\d{2}:\d{2}\s*$")
 TIMESTAMP_RE = re.compile(r"\d+号讲话人\s+\d{2}:\d{2}:\d{2}")
 PUNCT_RE = re.compile(r"[\s，。、“”‘’：:；;！？!?（）()\[\]【】《》<>—\-_.|/\\,`~@#$%^&*+=]+")
 SECTION_RE = re.compile(r"^#")
+SOURCE_SCORE_RE = re.compile(r"[（(]\s*\d+\s*分\s*[）)]")
+SOURCE_BARE_QUESTION_TITLE_RE = re.compile(r"^第[一二三四五六七八九十百两\d]+题[:：]?$")
 
 
 CHINESE_NUMS = {
@@ -1130,6 +1132,68 @@ def parse_source_markdown(path: Path) -> list[SourceChapter]:
     return chapters
 
 
+def source_title_has_score(text: str) -> bool:
+    return bool(SOURCE_SCORE_RE.search(text))
+
+
+def normalize_source_question_title(title: str) -> str:
+    return re.sub(r"(?:(?:．|\.)\s*){3,}", "", title).strip()
+
+
+def source_title_continuation_lines(lines: list[str]) -> list[tuple[int, str]]:
+    continuations: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("要求", "材料", "【")):
+            return []
+
+        continuations.append((index, stripped))
+        if source_title_has_score(stripped):
+            return continuations
+        if len(continuations) >= 3:
+            return []
+    return []
+
+
+def fold_source_question_title_continuations(chapters: list[SourceChapter]) -> int:
+    repairs = 0
+    for chapter in chapters:
+        for question in chapter.questions:
+            normalized_title = normalize_source_question_title(question.title)
+            if normalized_title != question.title:
+                question.title = normalized_title
+                repairs += 1
+
+            if source_title_has_score(question.title):
+                continue
+
+            content_lines = question.content.splitlines()
+            continuations = source_title_continuation_lines(content_lines)
+            if not continuations:
+                continue
+
+            continuation_text = "".join(text for _, text in continuations)
+            question.title = normalize_source_question_title(f"{question.title}{continuation_text}")
+            for line_index, _ in reversed(continuations):
+                del content_lines[line_index]
+            question.content = "\n".join(content_lines).strip()
+            repairs += 1
+    return repairs
+
+
+def source_question_title_needs_repair(title: str, question_text: str) -> bool:
+    if normalize_source_question_title(title) != title:
+        return True
+    if SOURCE_BARE_QUESTION_TITLE_RE.fullmatch(title):
+        return True
+    if source_title_has_score(title):
+        return False
+
+    return bool(source_title_continuation_lines(question_text.splitlines()))
+
+
 def normalize_source_key(text: str) -> str:
     text = "".join(text.split())
     return re.sub(r"[、，。:：（）()\[\]【】.\-\"'“”]", "", text)
@@ -1210,15 +1274,26 @@ def merge_source_chapters(
 def build_source(args: argparse.Namespace) -> int:
     if args.regenerate_problem or not PROBLEM_MD.exists():
         problem_chapters = convert_pdf_to_source_chapters(PROBLEM_PDF)
+        repair_count = fold_source_question_title_continuations(problem_chapters)
         PROBLEM_MD.write_text(render_source_markdown(problem_chapters), encoding="utf-8")
         print(f"Wrote {rel(PROBLEM_MD)}")
     else:
         problem_chapters = parse_source_markdown(PROBLEM_MD)
-        print(f"Using existing {rel(PROBLEM_MD)}")
+        repair_count = fold_source_question_title_continuations(problem_chapters)
+        if repair_count:
+            PROBLEM_MD.write_text(render_source_markdown(problem_chapters), encoding="utf-8")
+            print(f"Repaired and wrote {rel(PROBLEM_MD)}")
+        else:
+            print(f"Using existing {rel(PROBLEM_MD)}")
+    if repair_count:
+        print(f"Repaired problem question titles: {repair_count}")
 
     answer_chapters = convert_pdf_to_source_chapters(ANSWER_PDF)
+    answer_repair_count = fold_source_question_title_continuations(answer_chapters)
     ANSWER_MD.write_text(render_source_markdown(answer_chapters), encoding="utf-8")
     print(f"Wrote {rel(ANSWER_MD)}")
+    if answer_repair_count:
+        print(f"Repaired answer question titles: {answer_repair_count}")
 
     output, stats = merge_source_chapters(problem_chapters, answer_chapters)
     SOURCE_MD.write_text(output, encoding="utf-8")
@@ -2387,6 +2462,9 @@ def check(args: argparse.Namespace) -> int:
 
     if len(questions) != 115:
         errors.append(f"source question count expected 115, got {len(questions)}")
+    for question in questions:
+        if source_question_title_needs_repair(question.title, question.question_text):
+            errors.append(f"source question title appears split or malformed: {question.id} {question.title}")
     if output.count("### 🎧 讲解") != expected_rendered_questions:
         errors.append(
             "lecture section count expected "
